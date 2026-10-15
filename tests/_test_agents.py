@@ -231,8 +231,9 @@ check("inputs are not mutated", base["env"]["A"] == 1, base)
 print()
 print("[13] client registry integrity")
 
-check("all five expected clients registered",
-      sorted(A.CLIENTS) == ["claude-code", "codex", "crush", "dsh", "opencode"],
+check("all six expected clients registered",
+      sorted(A.CLIENTS) == ["claude-code", "codebuddy", "codex", "crush", "dsh",
+                            "opencode"],
       sorted(A.CLIENTS))
 ids = [c["id"] for c in A.CLIENTS.values()]
 check("registry ids are unique", len(set(ids)) == len(ids), ids)
@@ -472,6 +473,34 @@ check("crush provider written with base_url and key",
 check("crush model entries carry context_window",
       cr["providers"]["wb-proxy"]["models"][0]["context_window"] == 128000,
       cr["providers"]["wb-proxy"]["models"])
+
+# The CodeBuddy CLI appends /chat/completions itself, so the bare root is what
+# it must be given - a /v1 suffix would make it call /v1/chat/completions.
+A.integrate(acct6, "codebuddy", "http://gw:1/v1", "k-cbc", model="m-big",
+            models=models, home=home6)
+cbc_path = os.path.join(home6, ".codebuddy", "settings.json")
+with open(cbc_path, encoding="utf-8") as fh:
+    cbc = json.load(fh)
+check("codebuddy env carries the bare gateway root (no /v1)",
+      cbc.get("env", {}).get("CODEBUDDY_BASE_URL") == "http://gw:1", cbc)
+check("codebuddy env carries the key",
+      cbc.get("env", {}).get("CODEBUDDY_API_KEY") == "k-cbc", cbc)
+check("codebuddy default model written", cbc.get("model") == "m-big", cbc)
+check("codebuddy settings stay valid JSON around a foreign key",
+      isinstance(cbc.get("env"), dict) and len(cbc["env"]) == 2, cbc)
+
+pre_cbc = {"env": {"SOMETHING_ELSE": "keep"}, "model": "old"}
+with open(cbc_path, "w", encoding="utf-8") as fh:
+    json.dump(pre_cbc, fh)
+A.integrate(acct6, "codebuddy", "http://gw:1", "k2", home=home6)
+with open(cbc_path, encoding="utf-8") as fh:
+    cbc2 = json.load(fh)
+check("an unrelated env key survives a re-apply",
+      cbc2["env"].get("SOMETHING_ELSE") == "keep", cbc2)
+check("the key is replaced in place",
+      cbc2["env"].get("CODEBUDDY_API_KEY") == "k2", cbc2)
+check("no model given leaves the previous model alone",
+      cbc2.get("model") == "old", cbc2)
 
 for path in (codex_cfg, os.path.join(home6, ".codex", "auth.json"),
              dsh_settings, os.path.join(home6, ".dsh", ".credentials.yaml"),

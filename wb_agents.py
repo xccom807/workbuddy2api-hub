@@ -599,6 +599,32 @@ def _apply_dsh(paths, ctx):
     return {settings_path: text, credentials_path: cred_text}
 
 
+def _codebuddy_settings_path(home):
+    return os.path.join(home, ".codebuddy", "settings.json")
+
+
+def _apply_codebuddy(paths, ctx):
+    """把 WorkBuddy 桌面端自带的 CodeBuddy CLI 指向网关。
+
+    这个 CLI 自己会往 base 后面拼 `/chat/completions`（实测抓包：路径就是
+    `/chat/completions`，不带 `/v1`），所以这里跟 Claude Code 一样交裸根——
+    写成 `[.../v1]` 会拼出 `/v1/chat/completions`。网关两条都收，但别家
+    Anthropic/OpenAI 兼容网关不一定，交裸根是最保守的写法。
+
+    配置写在 CLI 自己的 user scope settings.json（`env` 与 `model` 两个键），
+    不是环境变量——这样用户重开终端也还在。
+    """
+    path = paths["settings"]
+    data = _load_json(path, "codebuddy settings")
+    env = dict(data.get("env") or {})
+    env["CODEBUDDY_BASE_URL"] = re.sub(r"/v1/?$", "", ctx["base_url"])
+    env["CODEBUDDY_API_KEY"] = ctx["api_key"]
+    data["env"] = env
+    if ctx.get("model"):
+        data["model"] = ctx["model"]
+    return {path: _dump_json(data)}
+
+
 def _apply_crush(paths, ctx):
     path = paths["config"]
     data = _load_json(path, "crush config")
@@ -701,6 +727,25 @@ CLIENTS = {
             or bool(shutil.which("crush"))
         ),
         "apply": _apply_crush,
+    },
+    "codebuddy": {
+        "id": "codebuddy",
+        "label": "CodeBuddy CLI (WorkBuddy)",
+        "desc": ("The CodeBuddy CLI bundled inside the WorkBuddy desktop app; "
+                 "points CODEBUDDY_BASE_URL at this gateway."),
+        "protocol": "openai",
+        "files": lambda home: {
+            "settings": _codebuddy_settings_path(home),
+        },
+        # The CLI ships inside the desktop app rather than on PATH, so the config
+        # directory (created the first time it runs) is the reliable signal;
+        # `which` only covers an npm-installed copy.
+        "probe": lambda home: (
+            os.path.isdir(os.path.join(home, ".codebuddy"))
+            or os.path.isfile(_codebuddy_settings_path(home))
+            or bool(shutil.which("codebuddy"))
+        ),
+        "apply": _apply_codebuddy,
     },
 }
 

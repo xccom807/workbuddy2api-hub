@@ -9459,8 +9459,13 @@ def _anthropic_blocks_to_messages(role, blocks):
     return out
 
 
-def messages_to_chat(payload):
-    """Translate an Anthropic Messages request into Chat Completions."""
+def messages_to_chat(payload, native_web_tools=False):
+    """Translate an Anthropic Messages request into Chat Completions.
+
+    native_web_tools=True 表示这次请求的伺服器端 web_search 由本网关自己跑
+    （见 native_search_request）。那种宣告不再是「这里没有的工具」，不该往
+    系统提示里塞一句「不可用、不要呼叫」——模型看到它只会更迷惑。
+    """
     if not isinstance(payload, dict):
         raise ValueError("request body must be a JSON object")
     model = _anthropic_text(payload.get("model")).strip()
@@ -9490,6 +9495,9 @@ def messages_to_chat(payload):
     if isinstance(metadata, dict) and metadata.get("user_id") is not None:
         chat["user"] = metadata.get("user_id")
     tools, skipped = anthropic_tools_to_chat(payload.get("tools"))
+    if native_web_tools and skipped:
+        handled = wb_webtools.SEARCH_DECL_TYPES + (wb_webtools.WEB_SEARCH_NAME,)
+        skipped = [s for s in skipped if str(s).strip().lower() not in handled]
     if tools:
         chat["tools"] = tools
     choice = _anthropic_tool_choice(payload.get("tool_choice"))
@@ -9537,6 +9545,49 @@ def messages_to_chat(payload):
                 messages.append({"role": role, "content": text})
     chat["messages"] = messages
     return chat
+
+
+def native_search_request(payload):
+    """客户端是不是把整则请求当成一次搜寻？是就回查询字串，否则 None。
+
+    形状（DSH 的 web_search provider 就是这么送的）：
+
+        {"messages": [{"role": "user", "content": [{"type": "text",
+                       "text": "Perform a web search for the query: 关键字"}]}],
+         "tools": [{"type": "web_search_20250305", "name": "web_search"}]}
+
+    它宣告的是 Anthropic 的**伺服器端**搜寻工具，也只读回应里的
+    web_search_tool_result 块——没有散文需求。所以这条路自己跑搜寻、直接回
+    结构化结果，不必再让模型跑一轮（那一轮的 token 与延迟它一分都用不上）。
+
+    形状对不上就回 None：普通对话、客户端自己执行的 function 形状 web_search、
+    多轮历史，全部照原本的管线走，行为不变。
+    """
+    if not isinstance(payload, dict):
+        return None
+    if not wb_webtools.native_search_declared(payload.get("tools")):
+        return None
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or len(messages) != 1:
+        return None
+    item = messages[0]
+    if not isinstance(item, dict):
+        return None
+    if _anthropic_text(item.get("role")).strip() != "user":
+        return None
+    content = item.get("content")
+    if isinstance(content, list):
+        if len(content) != 1:
+            return None
+        block = content[0] if isinstance(content[0], dict) else {}
+        if _anthropic_text(block.get("type")).strip() != "text":
+            return None
+        text = block.get("text")
+    else:
+        text = content
+    if not isinstance(text, str):
+        return None
+    return wb_webtools.native_search_query(text) or None
 
 
 def _anthropic_usage(usage):
@@ -9646,8 +9697,13 @@ def _anthropic_estimate_chat_tokens(chat):
     return sum(estimate_tokens(value) for value in values if value)
 
 
-def stream_messages_events(raw_iter, model, holder=None):
-    """Yield Anthropic Messages SSE frames from a chat-completions SSE stream."""
+def stream_messages_events(raw_iter, model, holder=None, prefix_blocks=None):
+    """Yield Anthropic Messages SSE frames from a chat-completions SSE stream.
+
+    prefix_blocks 是排在模型输出前面的块：伺服器端 web_search 先跑完，它的
+    server_tool_use / web_search_tool_result 要出现在文字之前，索引也从它们
+    开始数（Anthropic 自己的顺序就是这样）。传空迭代器进来时就只有这些块。
+    """
     holder = holder if isinstance(holder, dict) else {}
     state = {
         "started": False,
@@ -9662,6 +9718,8 @@ def stream_messages_events(raw_iter, model, holder=None):
         "tools": {},
         "tool_order": [],
         "usage": None,
+        "prefix": [b for b in (prefix_blocks or []) if isinstance(b, dict)],
+        "prefix_done": False,
     }
 
     def usage_payload():
@@ -9698,6 +9756,43 @@ def stream_messages_events(raw_iter, model, holder=None):
             "content_block": {"type": "text", "text": ""},
         })
 
+    def ensure_prefix():
+        """先把 prefix_blocks 发完，只发一次，索引照 state["next"] 往下排。
+
+        server_tool_use 的 input 走 input_json_delta（Anthropic 的 SDK 就是这样
+        累积参数的）；web_search_tool_result 是一次成型的块，不会有增量事件。
+        """
+        if state["prefix_done"]:
+            return
+        state["prefix_done"] = True
+        for block in state["prefix"]:
+            index = state["next"]
+            state["next"] += 1
+            if block.get("type") == "server_tool_use":
+                yield anthropic_sse_frame("content_block_start", {
+                    "index": index,
+                    "content_block": {
+                        "type": "server_tool_use",
+                        "id": _anthropic_text(block.get("id")),
+                        "name": _anthropic_text(block.get("name")),
+                        "input": {},
+                    },
+                })
+                yield anthropic_sse_frame("content_block_delta", {
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(block.get("input") or {},
+                                                   ensure_ascii=False),
+                    },
+                })
+            else:
+                yield anthropic_sse_frame("content_block_start", {
+                    "index": index,
+                    "content_block": block,
+                })
+            yield anthropic_sse_frame("content_block_stop", {"index": index})
+
     for line in raw_iter:
         if state["done"] or state["failed"]:
             break
@@ -9723,6 +9818,8 @@ def stream_messages_events(raw_iter, model, holder=None):
         start = ensure_start(chunk)
         if start:
             yield start
+        for frame in ensure_prefix():
+            yield frame
         # Capture usage before the choices guard: the final upstream frame
         # carries both the usage block and the finish_reason (and no delta),
         # so skipping it here would zero out every streaming usage row.
@@ -9792,6 +9889,8 @@ def stream_messages_events(raw_iter, model, holder=None):
         start = ensure_start(None)
         if start:
             yield start
+    for frame in ensure_prefix():
+        yield frame
     if state["text_open"]:
         state["text_open"] = False
         yield anthropic_sse_frame("content_block_stop", {"index": state["text_idx"]})
@@ -13220,12 +13319,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_messages(self, payload):
         """Serve an Anthropic Messages request through the chat pipeline."""
+        search_query = (native_search_request(payload)
+                        if local_web_tools_enabled() else None)
         try:
-            chat_req = messages_to_chat(payload)
+            chat_req = messages_to_chat(payload, native_web_tools=bool(search_query))
         except ValueError as exc:
             return self._anthropic_error(400, str(exc), "invalid_request_error")
         model = chat_req.get("model") or "unknown"
         want_stream = bool(chat_req.get("stream"))
+        if search_query:
+            # 这条路不碰上游。模型闸门（跨区、封禁模型、金钥限用清单）管的是
+            # 模型用量，这次请求一个 token 都不花，所以它们在这里不适用；API
+            # key 的认证在 do_POST 里已经做完了。
+            return self._messages_native_search_response(model, search_query, want_stream)
         session_key = extract_session_key(self.headers, chat_req)
         t_start = time.time()
         fp = prompt_fingerprint(chat_req.get("messages"))
@@ -13295,6 +13401,51 @@ class Handler(BaseHTTPRequestHandler):
                 upstream, model, fp, account, t_start,
                 base_body=chat_req, session_key=session_key,
                 realm=req_realm, effort=effort)
+
+    def _messages_native_search_response(self, model, query, want_stream):
+        """伺服器端搜寻的回应：结构化结果块，没有模型那一轮。
+
+        客户端（DSH 的 web_search provider 是参考实现）只读
+        web_search_tool_result 里的 url/title，散文它不看——多跑一轮模型只会
+        把每次搜寻的延迟与 token 都翻上去。所以这里自己跑搜寻、直接回结果。
+        """
+        blocks, sources, result = wb_webtools.anthropic_search_blocks(query)
+        if not sources:
+            # 搜寻没跑成。可读的原因要跟着回去，否则客户端只看到「零个来源」，
+            # 不知道是后端挂了还是真的没有结果。
+            blocks = blocks + [{"type": "text", "text": result}]
+        log("messages: native web_search %r -> %d source(s)"
+            % (query, len(sources)))
+        message = {
+            "id": _new_id("msg_"),
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": blocks,
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0,
+                      "cache_creation_input_tokens": 0,
+                      "cache_read_input_tokens": 0},
+        }
+        if not want_stream:
+            return self._json(200, message)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        holder = {}
+        try:
+            for frame in stream_messages_events(iter(()), model, holder,
+                                                prefix_blocks=blocks):
+                self.wfile.write(frame)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+        return None
 
     def _messages_nonstream_response(self, upstream, model, fp, account, t_start,
                                      base_body=None, session_key=None, realm=None,

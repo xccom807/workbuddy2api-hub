@@ -42,3 +42,8 @@ desktop.ini
 
 # Local Docker Compose override
 docker-compose.override.yml
+
+# 本机安装的客户端与它们的产物：桌面端整包 1.2GB、Playwright 缓存 400MB，
+# 既不该进仓库也不该进任何 fork（一个 git add -A 就会把它们全吞进去）。
+WorkBuddyAI/
+.playwright-cli/

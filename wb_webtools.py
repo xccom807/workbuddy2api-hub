@@ -20,6 +20,13 @@ v1.5.0 ~ 1.5.2 做过同一件事，被 revert（issue #43）。三个缺陷都�
 
 搜寻后端是 DuckDuckGo 的 HTML 版（不需要 API key）。任何失败都回一句可读的
 错误给模型，不假造结果。只用 Python 标准库。
+
+第二类客户端不是「宣告伺服器端工具、等模型去呼叫」，而是把整则 /v1/messages
+请求当成一次搜寻：唯一一则 user 讯息就是搜寻指令，回应里只读结构化结果块。
+DSH 的 web_search provider 就是这个形状（`web_search_20250305` + 一句
+"Perform a web search for the query: ..."）。这种请求由 native_search_query()
+认出来，anthropic_search_blocks() 组出 server_tool_use / web_search_tool_result
+两块——DeepSeek 官方端点回的就是这个形状，客户端解析的是它。
 """
 
 import html as _html
@@ -29,6 +36,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 WEB_SEARCH_NAME = "web_search"
 WEB_FETCH_NAME = "web_fetch"
@@ -36,6 +44,13 @@ WEB_FETCH_NAME = "web_fetch"
 # 客户端会用这几种 type 宣告同一个工具
 SEARCH_DECL_TYPES = ("web_search", "web_search_preview", "web_search_preview_2025_03_11")
 FETCH_DECL_TYPES = ("web_fetch",)
+
+# Anthropic 的**伺服器端**搜寻工具宣告。跟上面那几种「客户端自己执行」的宣告
+# 不是一回事：这个的意思是「服务端替我跑搜寻，把结构化结果回给我」。目前只有
+# DSH 的 web_search provider 用这个 type。
+NATIVE_SEARCH_DECL_TYPES = ("web_search_20250305",)
+# DSH 送来的一整则请求就是这一句，查询字串接在冒号后面。
+SEARCH_INSTRUCTION_PREFIX = "perform a web search for the query:"
 
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -378,6 +393,71 @@ def sources_from_result(result):
         if url and not any(s["url"] == url for s in out):
             out.append({"title": title or url, "url": url})
     return out
+
+
+def native_search_declared(tools):
+    """客户端宣告了 Anthropic 的伺服器端 web_search 吗。
+
+    只认 {"type": "web_search_20250305"} 这种形状。function 形状的同名工具是
+    客户端自己执行的，不归这条路管。
+    """
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        if str(t.get("type") or "").strip().lower() in NATIVE_SEARCH_DECL_TYPES:
+            return True
+    return False
+
+
+def native_search_query(text):
+    """从搜寻指令里取回查询字串；不是这个形状就回空字串。
+
+    指令形状是固定的（DSH 就是这么送的），所以这里不做模糊猜测：形状对不上
+    就回空字串，调用端照原本的管线走。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if not raw.lower().startswith(SEARCH_INSTRUCTION_PREFIX):
+        return ""
+    return raw[len(SEARCH_INSTRUCTION_PREFIX):].strip()
+
+
+def anthropic_search_blocks(query, num_results=5):
+    """跑一次搜寻，组成 Anthropic 的 server_tool_use + web_search_tool_result。
+
+    回传 (blocks, sources, result_text)。result_text 是原本要喂给模型的可读
+    字串，调用端拿它记录日志；客户端只读 blocks。
+
+    搜寻失败（后端不可达、没有结果）时不给空块冒充成功，也不编造来源：结果块
+    换成 Anthropic 自己的 web_search_tool_result_error 形状，sources 为空。
+    """
+    query = str(query or "").strip()
+    result = search(query, num_results)
+    sources = sources_from_result(result)
+    tool_use_id = "srvtoolu_" + uuid.uuid4().hex[:24]
+    if sources:
+        content = [{
+            "type": "web_search_result",
+            "url": s["url"],
+            "title": s.get("title") or s["url"],
+        } for s in sources]
+    else:
+        content = {"type": "web_search_tool_result_error", "error_code": "unavailable"}
+    blocks = [
+        {
+            "type": "server_tool_use",
+            "id": tool_use_id,
+            "name": WEB_SEARCH_NAME,
+            "input": {"query": query},
+        },
+        {
+            "type": "web_search_tool_result",
+            "tool_use_id": tool_use_id,
+            "content": content,
+        },
+    ]
+    return blocks, sources, result
 
 
 def execute(name, args_raw):

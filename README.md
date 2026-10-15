@@ -131,7 +131,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 111 个套件：83 个 Python + 28 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 113 个套件：84 个 Python + 29 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
@@ -203,9 +203,12 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 
 Codex App 这类客户端会在 Responses 请求里声明 `web_search` / `web_fetch`，而上游没有对应的执行器——声明送上去只会拿到一句 unsupported call。打开「设置 → 本地网络工具」后，网关把那份声明换成自己的同名 function，拦下模型的调用并在本地执行（搜索走 DuckDuckGo HTML 版，抓页面抓模型给出的 URL），再把结果喂回模型，最多代跑 3 轮（`WB_MAX_WEB_ROUNDS` 可调，上限 8）；搜索过程会作为 `web_search_call` 卡片事件与 `url_citation` 引用回到客户端。
 
+`/v1/messages` 上的**服务端**工具（`{"type": "web_search_20250305"}`）是另一条路：客户端的意思是「你替我跑这次搜寻，把结构化结果给我」。DSH (DeepSeek Harness) 的 `web_search` provider 就是这个形状——整则请求只有一句 `Perform a web search for the query: <关键字>`，而且只读回应里的 `web_search_tool_result` 块。打开开关后，网关自己跑一次本地搜寻，按 Anthropic 的形状回 `server_tool_use` + `web_search_tool_result`（每笔 `web_search_result` 带 url / title），**不再多跑一轮模型**：那一轮的 token 与延迟客户端一分都用不上，而搜寻本身是即时的。形状对不上时（普通对话、多轮历史、function 形状的同名工具）一律走原本的管线，行为一字不改。
+
 - 关闭时（默认）声明原样透传，客户端自己声明的搜索工具照常拿到调用；
 - 打开后网关会主动出网抓取模型给出的 URL（只挡字面私网地址），且每轮代跑都会多跑一次上游、多消耗该账号额度；国内网络下 DuckDuckGo 可能连不上，那时模型拿到的是错误文本；
 - 只影响声明了这两个工具的客户端，普通 `/v1/chat/completions` 客户端不经过这条路径。
+- `/v1/messages` 的服务端搜寻失败时回 Anthropic 自己的 `web_search_tool_result_error` 形状，外加一段可读原因——不编造来源，也不拿空结果冒充成功；这条路不碰上游，所以一次搜寻不消耗任何账号额度（面板的花费统计里自然也不会有它）。
 
 ### 8. 智能体一键配置
 
@@ -218,6 +221,7 @@ Codex App 这类客户端会在 Responses 请求里声明 `web_search` / `web_fe
 | OpenCode | `~/.config/opencode/opencode.json` | OpenAI 兼容（`@ai-sdk/openai-compatible`） |
 | DSH (DeepSeek Harness) | `~/.dsh/settings.yaml`、`~/.dsh/.credentials.yaml` | OpenAI 兼容 |
 | Crush (Charm Crush) | `~/.config/crush/crush.json` | OpenAI 兼容 |
+| CodeBuddy CLI（WorkBuddy 桌面端自带） | `~/.codebuddy/settings.json` | OpenAI 兼容 Chat Completions（自动剥 `/v1` 后缀——这个 CLI 自己会拼 `/chat/completions`） |
 
 用法：打开看板 →「智能体配置」→ 选 API Key（支持全局默认或绑定特定出口的多 Key）、默认模型与网关地址 → 在检测到的客户端卡片上点「一键配置」；随时可点「一键还原」。
 
@@ -291,7 +295,7 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 网关原生实现 `/v1/messages`（流式与非流式）：`system`（字符串或文本块数组）、`text` / `image` / `document` / `tool_use` / `tool_result` 内容块双向转换，`tools` + `tool_choice`、`stop_sequences`、`metadata.user_id`、`thinking` / `output_config.effort` 全部映射到上游；流式输出是原生事件序列（`message_start` → `content_block_start` / `content_block_delta` → `content_block_stop` → `message_delta` → `message_stop`）；鉴权接受 `x-api-key` 或 `Authorization: Bearer`，错误一律用 Anthropic 的错误信封。
 
-边界：服务端工具（`web_search` 等）上游不支持，会被丢弃并在 system 里注明，不会伪造调用；`thinking` / `redacted_thinking` 块不回放（上游不提供可验证签名）；`top_k`、`cache_control`、`context_management` 与 `betas` 忽略；`/v1/messages/count_tokens` 返回的是网关的 CJK 感知估算值（与用量统计同一套估算器），**不是**官方分词器的精确值。
+边界：服务端工具（`web_search` 等）上游不支持——`web_search_20250305` 这一种在客户端把整则请求当成一次搜寻时由网关本地代跑（见「本地网络工具」一节），其余仍然丢弃并在 system 里注明，不会伪造调用；`thinking` / `redacted_thinking` 块不回放（上游不提供可验证签名）；`top_k`、`cache_control`、`context_management` 与 `betas` 忽略；`/v1/messages/count_tokens` 返回的是网关的 CJK 感知估算值（与用量统计同一套估算器），**不是**官方分词器的精确值。
 
 ---
 
@@ -332,6 +336,14 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 <!-- 发版时：把下面的 Unreleased 段落整理成新版本号（## vX.Y.Z），整体移入 docs/CHANGELOG.md 顶部 -->
 
 ### Unreleased
+
+- **WorkBuddy 桌面端自带的 CodeBuddy CLI 接进来了：一键配置 + Codex 派活通道**。`WorkBuddyAI\resources\app.asar.unpacked\cli\` 里就是一个完整的 `@genie/agent-cli`（`codebuddy` / `cbc`，v2.156.0，带 headless bundle），实测它说的就是标准 **OpenAI Chat Completions**（`POST /chat/completions`，`stream: true`，`Bearer` + `x-api-key` 双头），所以不需要任何适配层：
+  - 「智能体配置」新增第 6 个客户端 **CodeBuddy CLI (WorkBuddy)**：写 `~/.codebuddy/settings.json` 的 `env.CODEBUDDY_BASE_URL` + `env.CODEBUDDY_API_KEY` 与默认 `model`，可一键还原、保留文件里原有的其它键。**注意这个 CLI 自己会往 base 后面拼 `/chat/completions`**，所以写进去的是裸根（`http://127.0.0.1:8788`）——写成 `.../v1` 会拼出 `/v1/chat/completions`（本网关两条都收，别家不一定）。
+  - 新增 `mcp/wb-mcp.mjs`：零依赖 stdio MCP 服务器，给 Codex 三个工具——`workbuddy_task`（headless `-p` 派活，支持 `--json-schema` 结构化回传、超时杀整棵进程树、返回值自动脱敏）、`workbuddy_models`、`workbuddy_health`。与 `dsh-mcp` 并列写进 `~/.codex/config.toml` 的 `[mcp_servers]`；实测 Codex 客户端**不用重启**，新开一个会话就会拉起它（观察到 `codex.exe` 按会话 spawn `wb-mcp.mjs`）。
+  - 测试：`tests/_test_wb_mcp.js`（51 项，用假 CLI 替身跑 JSON-RPC 全链路，不碰网络与额度；`WB_MCP_LIVE=1` 时再补 2 项真机联调）、`tests/_test_agents.py` 补 codebuddy 的写盘 / 幂等 / 外来键保留用例。
+  - 实测证据：`codebuddy -p "只回复两个字：收到"` 经本网关 8 秒返回真实模型回答；`workbuddy_task` 真机联调 8.1 秒返回「在线」。
+
+- **`/v1/messages` 接手 Anthropic 的服务端 `web_search`，DSH 的联网搜索可以走本网关了**：客户端声明 `{"type": "web_search_20250305"}`、并且整则请求就是一句 `Perform a web search for the query: <关键字>` 时（DSH 的 `web_search` provider 就是这个形状），打开「设置 → 本地网络工具」后网关自己跑一次本地搜索，按 Anthropic 的形状回 `server_tool_use` + `web_search_tool_result`（每笔 `web_search_result` 带 url / title），**不再多跑一轮模型**——一次搜索只花一次 DuckDuckGo 抓取，不消耗任何账号额度，也不必再雇一个官方搜索端点。DSH 侧把 Web search 的 Endpoint 指到本网关即可（provider 默认打 DeepSeek 官方的 `/anthropic/v1`）。形状对不上时行为一字不改：普通对话、多轮历史、function 形状的同名工具、以及开关关闭时，全部照原管线走（那条「这些服务端工具不可用」的 system 注记也只在没接手时出现）。搜索失败回 Anthropic 自己的 `web_search_tool_result_error` 形状外加一段可读原因，不编造来源、不拿空结果冒充成功。新增 `tests/_test_anthropic_web_search.py`（42 项）。
 
 - **小响应不再白付 40ms、突发并发不再卡 1 秒**（[PR #237](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/237)，感谢 [@aodianjun](https://github.com/aodianjun)）：服务端关掉 Nagle（响应头与响应体两次 write 不再互相等 ACK，werkzeug/uvicorn 同做法），listen backlog 从 stdlib 默认的 5 提到 128（面板打开一页就是 ~7 个并发）。真机（OpenWrt / Celeron N2840）：`/health` 中位 50.0ms → 1.41ms，64 并发突发「卡 ≥1s」43/64 → 0/64。顺带把单请求体上限默认从 50MB 收到 16MB（`WB_MAX_PAYLOAD_BYTES` 可调回）——读 body 发生在 chat 信号量之前，路由器上几个并发大 body 就能把内存打穿。
 
